@@ -1,0 +1,282 @@
+# ЯЧЕЙКА 10. Автоматически собрать README.md и research.md с РЕАЛЬНЫМИ числами (запускать после ячеек 1-7 и 9)
+_missing = [n for n in ["DF", "BUNDLE", "RESULTS", "TRAINED", "CONFIGS", "SHORTCUT_AUC"] if n not in globals()]
+if _missing:
+    raise RuntimeError(f"Нет переменных {_missing}: сначала выполните ячейки 1-7.")
+Path("outputs").mkdir(exist_ok=True)
+
+K_TEST, K_EXT = "TEST: оба источника", "ВНЕШНИЙ: DIBaS (обучение только на multi)"
+
+
+def fm(x, d=2):
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return "n/a"
+        return f"{x:.{d}f}"
+    except Exception:
+        return str(x)
+
+
+def ci(t):
+    return "n/a" if (t is None or t[0] is None) else f"[{t[0]}; {t[1]}]"
+
+
+def V(m, k, d=2):
+    return fm(m.get(k), d) if m else "n/a"
+
+
+def df_to_md(d):
+    d = d.reset_index()
+    cols = [str(c) for c in d.columns]
+    lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    for _, r in d.iterrows():
+        lines.append("| " + " | ".join(str(v) for v in r.values) + " |")
+    return "\n".join(lines)
+
+
+def results_table(keys):
+    rows = ["| Набор | N (из них E. coli) | Recall E. coli (95% ДИ) | Precision E. coli | Balanced acc (95% ДИ) | ROC-AUC | PR-AUC | Принято без Uncertain | E. coli ушло в Uncertain |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for k in keys:
+        m = RESULTS.get(k)
+        if not m:
+            continue
+        rows.append(f"| {k} | {m['n']} ({m['n_ecoli']}) | {fm(m['recall_ecoli'])} {ci(m['recall_ci95'])} | "
+                    f"{fm(m['precision_ecoli'])} | {fm(m['balanced_acc'])} {ci(m['balanced_acc_ci95'])} | "
+                    f"{fm(m['roc_auc'])} | {fm(m['pr_auc'])} | {fm(m['coverage'] * 100, 0)} % | "
+                    f"{m['ecoli_uncertain']} из {m['n_ecoli']} |")
+    return "\n".join(rows)
+
+
+def error_list(pred_df, n=5):
+    if pred_df is None:
+        return "- (нет данных: запустите соответствующую ячейку оценки)"
+    w = pred_df[pred_df["pred"] != pred_df["label"]].sort_values("confidence", ascending=False).head(n)
+    out = [f"- `{Path(r.path).name}` (вид: {r.species}; истина: {r.label_name}; p(E. coli) = {r.p_ecoli:.2f}) — ⟦что видно на картинке и почему модель могла ошибиться; как это проверить⟧"
+           for r in w.itertuples()]
+    return "\n".join(out) if out else "- ошибок на этом наборе нет"
+
+
+# ---- числа из ноутбука ----
+m_t, m_x = RESULTS.get(K_TEST, {}), RESULTS.get(K_EXT, {})
+n_all, n_ec = len(DF), int(DF["label"].sum())
+src_counts = DF.groupby("source").agg(картинок=("path", "count"), E_coli=("label", "sum"), видов=("species", "nunique"))
+comp_split = pd.crosstab([DF["source"], DF["label_name"]], DF["split"], margins=True)
+sz = DF.groupby("group")["path"].transform("count")
+n_dupg, n_dupi = DF.loc[sz > 1, "group"].nunique(), int((sz > 1).sum())
+n_dropped = len(globals().get("drop_paths", []))
+n_mixed = len(globals().get("mixed_groups", []))
+idx_m, idx_d = np.where(DF["source"].values == "multi")[0], np.where(DF["source"].values == "dibas")[0]
+n_overlap = int((hamming_matrix(BITS[idx_d], BITS[idx_m]).min(axis=1) <= DUP_THRESH).sum()) if len(idx_m) and len(idx_d) else 0
+shift = DF.groupby("source")[["width", "height", "brightness", "contrast", "sharpness", "border_brightness"]].mean().round(1)
+tr_lines = "\n".join(f"| {k} | {cfg} | {fm(TRAINED[k]['val_auc'], 3)} | {fm(TRAINED[k]['val_score'], 3)} | {fm(TRAINED[k]['T'])} | {TRAINED[k]['tau']} |"
+                     for k, cfg in CONFIGS.items())
+sc_lines = ", ".join(f"{k}: {v:.2f}" for k, v in SHORTCUT_AUC.items()) or "не считался"
+fungi = [x for x in DF["species"].unique() if ("aspergillus" in x or "candida" in x)]
+fungi_note = (" Среди них есть грибы (Aspergillus niger, Candida albicans) — они не бактерии, но оставлены как «другие микроорганизмы» в классе Not E. coli."
+              if fungi else "")
+species_multi = ", ".join(sorted(DF.loc[DF["source"] == "multi", "species"].str.replace("_gram stain", "").unique()))
+cmp_line = ""
+if m_t and m_x:
+    d = m_t["balanced_acc"] - m_x["balanced_acc"]
+    cmp_line = (f"Balanced accuracy: {fm(m_t['balanced_acc'])} на test против {fm(m_x['balanced_acc'])} на независимом наборе "
+                f"(разница {fm(d)}); recall по E. coli: {fm(m_t['recall_ecoli'])} против {fm(m_x['recall_ecoli'])}.")
+
+for nm, pdf in [("test", globals().get("PRED_TEST")), ("external", globals().get("PRED_EXT"))]:
+    if pdf is not None:
+        w = pdf[pdf["pred"] != pdf["label"]].sort_values("confidence", ascending=False).head(8)
+        if len(w):
+            contact_sheet(w["path"].tolist(), [f"ERR {r.species} p={r.p_ecoli:.2f}" for r in w.itertuples()]).save(f"outputs/errors_{nm}.png")
+
+README = f"""# Классификатор E. coli / Not E. coli / Uncertain по микроскопическим изображениям
+
+Учебный прототип для тестового задания: принимает микроскопическое изображение бактерий и возвращает
+**E. coli**, **Not E. coli** или **Uncertain** (модель не уверена) + степень уверенности.
+Это исследовательский прототип, **не диагностический инструмент**.
+
+## Кратко
+
+- Данные: {n_all} микроскопических изображений (окраска по Граму) из двух независимых источников; E. coli среди них: {n_ec}.
+- Модель: ResNet-18 (предобучена на ImageNet), дообучена; выбранный вариант обучения: `{BEST_NAME}`.
+- Test (пул двух источников): recall по E. coli = {V(m_t, 'recall_ecoli')}, precision = {V(m_t, 'precision_ecoli')}, balanced accuracy = {V(m_t, 'balanced_acc')}.
+- Независимая проверка (обучение только на одном источнике, проверка на другом): balanced accuracy = {V(m_x, 'balanced_acc')}, recall по E. coli = {V(m_x, 'recall_ecoli')}.
+- Главное ограничение: очень мало примеров E. coli ({n_ec} на всё), поэтому оценки шумные (см. доверительные интервалы).
+
+## Как запустить
+
+1. Открыть блокнот `ecoli_colab.ipynb` в Google Colab, включить GPU (T4).
+2. Запустить ячейки 1-9 сверху вниз. Ячейка 2 подключает наборы данных (Kaggle: Multi-Organism Bacterial Imaging Dataset и DIBaS).
+3. Ячейка 8 запускает интерфейс (Gradio), ячейка 9 сохраняет модель и таблицы, ячейка 10 собирает эти документы.
+
+Зависимости: `torch`, `torchvision`, `scikit-learn`, `pandas`, `pillow`, `gradio`, `kagglehub`. Random seed = {SEED}.
+
+## Данные
+
+| Источник | Что это | Как использован |
+|---|---|---|
+| multi | Kaggle: Multi-Organism Bacterial Imaging Dataset, только папки «gram stain» (микроскопия) | обучение / val / test; 640×640 px |
+| dibas | Kaggle-зеркало DIBaS (окраска по Граму, микроскопия) | обучение / val / test и независимая проверка; не более {CAPS.get('dibas')} картинок на вид |
+
+{df_to_md(src_counts)}
+
+**Что исключено и почему.** В наборе multi у каждого организма есть две папки: «gram stain» (микроскопия) и «media plate»
+(фотографии колоний на питательной среде). Задание про микроскопические изображения, поэтому папки «media plate» исключены.
+Организмы в multi: {species_multi}.{fungi_note}
+
+**Как сформированы классы.** E. coli — папки, в названии которых есть «escherichia» / «e.coli». Всё остальное — Not E. coli.
+Метки в наборах заданы по виду, а не по штамму.
+
+## Проверка данных
+
+- **Дубликаты.** Перцептивный хэш (DCT, 64 бита), порог Хэмминга ≤ {DUP_THRESH}. Групп почти-дубликатов: {n_dupg} (картинок в них: {n_dupi}).
+  Групп с обоими классами было {n_mixed}; идентичные копии с разными метками (ошибка разметки) удалены: {n_dropped} шт.
+  Остальные совпадения хэша — похожие по виду снимки, они просто остаются в одной части разбиения.
+- **Проверка на «читерские» признаки.** Классификатор, которому доступны только метаданные (размер, цвет, яркость, контраст, резкость, яркость фона), обучен отдельно на каждом источнике (групповая кросс-валидация). AUC: {sc_lines}. Значение около 0.5 означает, что класс по таким признакам не угадать; заметно выше — что классы различаются техническими признаками съёмки.
+- **Пересечение источников.** Картинок из DIBaS, почти совпадающих с картинками multi (Хэмминг ≤ {DUP_THRESH}): {n_overlap}.
+- **Разбиение** 60/20/20 по группам дубликатов, стратификация по источнику и виду (`StratifiedGroupKFold`), одна и та же картинка не может попасть в train и test.
+
+{df_to_md(comp_split)}
+
+## Модель и обучение
+
+- ResNet-18 с весами ImageNet, выход на 2 класса; вход {IMG_SIZE}×{IMG_SIZE}. Все снимки один раз приводятся к этому размеру и хранятся в памяти.
+- Аугментации: случайный кроп, отражения, повороты, небольшой цветовой джиттер, редкий перевод в оттенки серого (чтобы модель меньше опиралась на оттенок окраски).
+- Дисбаланс классов: взвешенная функция потерь.
+- Два варианта: только последний слой (`head_only`) и «последний слой, затем вся сеть с малым lr» (`finetune`). Эпоха и вариант выбираются **только по валидации** (среднее AUC и balanced accuracy).
+
+| Вариант | Параметры | val AUC на лучшей эпохе | Балл выбора | Temperature | tau |
+|---|---|---|---|---|---|
+{tr_lines}
+
+Выбран вариант `{BEST_NAME}`.
+
+## Правило Uncertain
+
+После softmax (с температурой, подобранной на val для более честной уверенности): `confidence = max(p, 1 - p)`.
+Если `confidence < tau`, программа отвечает **Uncertain** и объясняет причину. Порог tau = **{BUNDLE['tau']}** выбран на валидации:
+наименьший порог не ниже 0.70, при котором точность среди принятых ≥ 95 % и принимается ≥ 80 % картинок.
+Также Uncertain возвращается для слишком маленьких изображений (< 96 px).
+Ограничение: правило по уверенности не гарантирует, что модель заметит совсем «чужое» изображение (не микроскопию).
+
+## Результаты
+
+{results_table([K_TEST, 'TEST: только multi', 'TEST: только dibas', K_EXT])}
+
+Recall и precision считаются для класса E. coli **без учёта Uncertain** (порог 0.5); доля принятых и «E. coli ушло в Uncertain» показывают, что делает правило Uncertain.
+Accuracy не приводится как главная метрика: E. coli — меньшинство, и высокая accuracy возможна при плохом recall.
+
+{cmp_line}
+
+Сравнение источников по простым характеристикам снимков (среднее):
+
+{df_to_md(shift)}
+
+**Объяснение разницы между test и независимой проверкой.** ⟦Напишите своими словами, опираясь на числа выше: другой микроскоп/окраска/фон, виды, которых не было в обучении, малое число E. coli. Что подтверждается данными, а что — только гипотеза.⟧
+
+## Разбор ошибок
+
+Картинки самых уверенных ошибок сохранены в `errors_test.png` и `errors_external.png` (ячейка 10).
+
+Test:
+{error_list(globals().get('PRED_TEST'))}
+
+Независимая проверка:
+{error_list(globals().get('PRED_EXT'))}
+
+## Ограничения
+
+- Мало данных: всего {n_ec} изображений E. coli; доверительные интервалы широкие.
+- Метки на уровне вида; штаммы и условия съёмки неизвестны.
+- Все изображения приведены к квадрату {IMG_SIZE}×{IMG_SIZE} (у DIBaS исходное соотношение сторон другое).
+- Два набора окрашены по Граму; на снимках без окраски или с другим увеличением качество не проверялось.
+- Uncertain по уверенности не ловит все «чужие» изображения.
+
+## Что можно улучшить
+
+- Больше независимых источников и проверка «оставить один источник для теста» для каждого.
+- Визуализация того, на что смотрит модель (Grad-CAM), чтобы убедиться, что это бактерии, а не фон.
+- Явный детектор «это не микроскопия» (расстояние в пространстве признаков) для более надёжного Uncertain.
+- Калибровка порога на большем валидационном наборе.
+
+## Ответ на дополнительный вопрос: 98 % accuracy на внутреннем test — значит ли, что модель хорошо распознаёт E. coli?
+
+**Нет, не значит.**
+
+1. Внутренний test взят из того же источника, что и обучение (одна камера, окраска, фон). Если классы различаются техническими признаками или дубликаты попали в разные части, модель выучит «признаки набора», а не бактерию, и accuracy этого не покажет.
+2. При дисбалансе классов высокая accuracy возможна при плохом recall по E. coli. Нужны recall/precision для E. coli, PR-AUC и матрица ошибок.
+3. Маленький test даёт широкий доверительный интервал: при ~100 картинках 98 % — это около 2 ошибок.
+4. Внутренний test не проверяет виды и условия съёмки, которых не было в обучении.
+
+Как проверить: независимый источник, не участвовавший ни в обучении, ни в подборе параметров; разбиение по группам дубликатов и по источникам; проверка «читерских» признаков; метрики по E. coli с доверительными интервалами и разбор ошибок по видам; в идеале новые снимки из другой лаборатории.
+
+## Использование AI-инструментов
+
+⟦Опишите честно, где использовали AI (поиск датасетов, каркас кода, отладка) и что проверяли и меняли сами.⟧
+"""
+
+RESEARCH = f"""# research.md — журнал поиска и решений
+
+## 1. Какие датасеты рассматривались
+
+| # | Источник | Содержание | Итог |
+|---|---|---|---|
+| 1 | Kaggle: Multi-Organism Bacterial Imaging Dataset | 10 организмов × 2 типа съёмки («gram stain» — микроскопия, «media plate» — колонии на чашке), 629 изображений, 640×640 | Использован, но только микроскопия («gram stain»). Есть грибы (Aspergillus, Candida) |
+| 2 | Kaggle-зеркало DIBaS (Zieliński et al., 2017) | много видов, окраска по Граму, микроскопия; размер архива ~4 ГБ | Использован; не более {CAPS.get('dibas')} картинок на вид. В пуле: {int((DF['source'] == 'dibas').sum())} картинок, {DF.loc[DF['source'] == 'dibas', 'species'].nunique()} видов |
+| 3 | Kaggle-набор «foodborne pathogens» (600 фото, по 150 на род Escherichia, Listeria, Salmonella, Staphylococcus; описан в PeerJ CS) | по описанию подходил лучше всего | Не использован: не удалось найти точную страницу набора и проверить содержимое. ⟦если найдёте ссылку — впишите⟧ |
+| 4 | Hallström et al., 2023 (Zenodo, таймлапсы микрофлюидики) | много кадров одних и тех же ловушек | Не использован: сложный формат и высокий риск утечки между кадрами |
+| 5 | Roboflow Universe | ⟦что смотрели и почему не взяли / взяли⟧ | ⟦⟧ |
+
+## 2. Принятые решения
+
+- Только микроскопия: папки «media plate» исключены, так как это фотографии колоний, а не микроскопические изображения.
+- Два независимых источника. Никакие данные не смешивались «по классам» (E. coli из одного набора, остальное из другого), чтобы модель не училась отличать набор, а не бактерию. В каждом источнике есть оба класса.
+- Разбиение по группам дубликатов и стратификация по источнику и виду; параметры и порог Uncertain подбираются только по val.
+- Основная метрика — recall и precision по E. coli с доверительными интервалами, а не accuracy.
+
+## 3. Проверка данных (числа из запуска)
+
+- Картинок в пуле: {n_all}; E. coli: {n_ec}.
+- Групп почти-дубликатов: {n_dupg} (картинок в них: {n_dupi}); групп с обоими классами было {n_mixed}; удалено идентичных копий с неверной меткой: {n_dropped}.
+- «Читерский» тест (AUC по метаданным): {sc_lines}.
+- Пересечение DIBaS и multi по хэшу: {n_overlap} картинок.
+- Различия источников по простым характеристикам снимков:
+
+{df_to_md(shift)}
+
+## 4. Ход экспериментов
+
+1. **Просмотр данных.** Набор multi содержит фото чашек (media plate) рядом с микроскопией (gram stain); чашки исключены, остаются 325 микроскопических изображений, из них 30 — E. coli.
+2. **Первая попытка обучения** (только источник multi, ResNet-18, сразу дообучается вся сеть, 12 эпох): потери на обучении падали (0.67 → 0.17), а качество на валидации не росло (AUC 0.59-0.74) — переобучение при ~20 примерах E. coli в обучении.
+3. **Смена данных:** добавлен второй источник (DIBaS), чтобы увеличить число E. coli и получить независимую проверку.
+4. **Смена обучения:** сначала только последний слой, затем аккуратное дообучение всей сети с малым lr (`finetune`) в сравнении с вариантом `head_only`; выбор эпохи по среднему AUC и balanced accuracy на val.
+
+| Вариант | Параметры | val AUC на лучшей эпохе | Балл выбора | Temperature | tau |
+|---|---|---|---|---|---|
+{tr_lines}
+
+Выбран вариант `{BEST_NAME}`.
+
+## 5. Итоговые метрики
+
+{results_table([K_TEST, 'TEST: только multi', 'TEST: только dibas', K_EXT])}
+
+{cmp_line}
+
+## 6. Что пошло не так по ходу работы
+
+- Набор, рекомендованный AI-ассистентом на первом шаге (600 фото, 4 рода), найти не удалось; фактически использованный набор оказался другим (10 организмов × 2 типа съёмки), в нём была часть фото чашек. Это было замечено при просмотре структуры папок и исправлено.
+- ⟦Допишите свои трудности и как их решили (загрузка данных в Colab, ошибки, что поменяли).⟧
+
+## 7. Виды в пуле
+
+{df_to_md(DF.groupby(['source', 'species']).size().reset_index(name='картинок').set_index(['source', 'species']))}
+"""
+
+Path("outputs/README.md").write_text(README)
+Path("outputs/research.md").write_text(RESEARCH)
+shutil.make_archive("ecoli_results", "zip", "outputs")
+print("Готово: outputs/README.md, outputs/research.md, outputs/errors_*.png. Архив ecoli_results.zip обновлён.")
+try:
+    from google.colab import files
+    files.download("ecoli_results.zip")
+except ImportError:
+    pass
